@@ -1,0 +1,55 @@
+[package]
+name = "tiles"
+version = "0.1.0"
+edition = "2024"
+description = "Fast self-hosted tile server and fetcher for PMTiles and VersaTiles containers"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Quad4-Software/tiles"
+readme = "README.md"
+keywords = ["pmtiles", "versatiles", "tiles", "osm", "maps"]
+categories = ["web-programming::http-server", "science::geo"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+object_store = { version = "0.14", features = ["aws"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-saphyr = "1"
+tokio = { version = "1", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+versatiles_container = "4.15"
+versatiles_core = "4.15"
+osmpbfreader = "0.19"
+geo = "0.33"
+versatiles_geometry = "4.15"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+versatiles_container = { version = "4.15", features = ["test"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

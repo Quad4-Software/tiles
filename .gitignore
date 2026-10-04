@@ -1,0 +1,5 @@
+/target
+/data
+*.versatiles
+*.pmtiles
+*.mbtiles
