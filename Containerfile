@@ -19,6 +19,6 @@ EXPOSE 8080
 LABEL org.opencontainers.image.title="tiles" \
 	org.opencontainers.image.description="Self-hosted PMTiles/VersaTiles tile server, fetcher, and .osm.pbf tile generator" \
 	org.opencontainers.image.source="https://github.com/Quad4-Software/tiles" \
-	org.opencontainers.image.licenses="MIT OR Apache-2.0"
+	org.opencontainers.image.licenses="LicenseRef-Quad4Permissive"
 ENTRYPOINT ["tiles"]
 CMD ["serve", "--config", "/data/config.yaml"]

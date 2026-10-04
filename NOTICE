@@ -1,0 +1,8 @@
+tiles contains or builds upon:
+
+- MapLibre GL JS (assets/maplibre-gl.js, assets/maplibre-gl.css)
+  BSD 3-Clause License, https://github.com/maplibre/maplibre-gl-js
+  The license notice is embedded in the vendored files.
+- versatiles-rs crates (versatiles_container, versatiles_core,
+  versatiles_geometry) - MIT License
+  https://github.com/versatiles-org/versatiles-rs

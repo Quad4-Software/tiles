@@ -119,4 +119,4 @@ cargo build --release
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0, at your option.
+Quad4 Permissive License, see LICENSE. Permissive: use it for anything, keep the copyright notice, do not claim modified copies are the original.
