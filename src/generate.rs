@@ -5,6 +5,7 @@
 //! per tile, encode as MVT, and write a .pmtiles or .versatiles container
 //! through the normal container writer.
 
+use std::sync::{Mutex, RwLock};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -20,6 +21,7 @@ use geo::{
     Point, Polygon, SimplifyVw,
 };
 use osmpbfreader::{OsmId, OsmObj, OsmPbfReader, Tags};
+use redb::ReadableDatabase;
 use tracing::info;
 use versatiles_container::{
     SourceType, Tile, TileSource, TileSourceMetadata, TilesRuntime, Traversal,
@@ -46,6 +48,83 @@ pub struct GenerateArgs {
     pub output: PathBuf,
     pub minzoom: u8,
     pub maxzoom: u8,
+    /// Directory for the on-disk node index; defaults to a system temp dir.
+    pub workdir: Option<PathBuf>,
+}
+
+/// On-disk node/way-member index (redb, mmap backed) so extraction does not
+/// hold every node in RAM. Node coordinates are stored as OSM decimicro
+/// degrees (i32 pairs, 8 bytes per node).
+const NODES_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("nodes");
+const MEMBER_WAYS_TABLE: redb::TableDefinition<u64, &[u8]> =
+    redb::TableDefinition::new("member_ways");
+const WRITE_BATCH: usize = 2_000_000;
+
+struct DiskIndex {
+    db: redb::Database,
+    write: Mutex<Option<(redb::WriteTransaction, usize)>>,
+    read: RwLock<Option<redb::ReadTransaction>>,
+}
+
+impl DiskIndex {
+    fn create(path: &Path) -> Result<Self> {
+        Ok(Self {
+            db: redb::Database::create(path).context("create index db")?,
+            write: Mutex::new(None),
+            read: RwLock::new(None),
+        })
+    }
+
+    /// Insert into a table, committing every WRITE_BATCH rows so memory stays
+    /// bounded on planet-scale inputs.
+    fn insert(&self, table: redb::TableDefinition<u64, &[u8]>, key: u64, val: &[u8]) -> Result<()> {
+        let mut guard = self.write.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some((self.db.begin_write()?, 0));
+        }
+        let (w, n) = guard.as_mut().unwrap();
+        {
+            let mut t = w.open_table(table)?;
+            t.insert(key, val)?;
+        }
+        *n += 1;
+        if *n >= WRITE_BATCH {
+            *n = 0;
+            let new_w = self.db.begin_write()?;
+            let old = std::mem::replace(w, new_w);
+            old.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Commit pending writes and enable reads.
+    fn finish_writes(&self) -> Result<()> {
+        if let Some((w, _)) = self.write.lock().unwrap().take() {
+            w.commit()?;
+        }
+        let mut guard = self.read.write().unwrap();
+        *guard = Some(self.db.begin_read()?);
+        Ok(())
+    }
+
+    fn get(&self, table: redb::TableDefinition<u64, &[u8]>, key: u64) -> Result<Option<Vec<u8>>> {
+        let guard = self.read.read().unwrap();
+        let Some(txn) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let t = txn.open_table(table)?;
+        Ok(t.get(key)?.map(|g| g.value().to_vec()))
+    }
+
+    fn node(&self, id: i64) -> Option<(f64, f64)> {
+        let v = self.get(NODES_TABLE, id as u64).ok()??;
+        if v.len() != 8 {
+            return None;
+        }
+        let lat = i32::from_le_bytes(v[0..4].try_into().ok()?) as f64 * 1e-7;
+        let lon = i32::from_le_bytes(v[4..8].try_into().ok()?) as f64 * 1e-7;
+        Some((lon, lat))
+    }
 }
 
 struct Feature {
@@ -61,6 +140,25 @@ struct Feature {
 
 fn classify(tags: &Tags, is_area: bool) -> Option<(&'static str, u8)> {
     let natural = tags.get("natural").map(|v| v.as_str());
+    if let Some(b) = tags.get("boundary")
+        && b.as_str() == "administrative"
+    {
+        let lvl: u8 = tags
+            .get("admin_level")
+            .and_then(|v| v.as_str().parse().ok())
+            .unwrap_or(9);
+        let z = match lvl {
+            2 => 0,
+            3 | 4 => 4,
+            5 | 6 => 7,
+            7 | 8 => 9,
+            _ => 11,
+        };
+        return Some(("boundaries", z));
+    }
+    if tags.contains_key("aeroway") {
+        return Some(("aeroway", 9));
+    }
     if matches!(natural, Some("water" | "bay" | "strait" | "spring"))
         || tags
             .get("landuse")
@@ -97,8 +195,20 @@ fn classify(tags: &Tags, is_area: bool) -> Option<(&'static str, u8)> {
         };
         return Some(("places", z));
     }
-    if tags.contains_key("landuse") {
+    if tags.contains_key("landuse")
+        || matches!(
+            tags.get("leisure").map(|v| v.as_str()),
+            Some("park" | "garden" | "golf_course" | "nature_reserve" | "pitch" | "playground")
+        )
+        || matches!(
+            tags.get("boundary").map(|v| v.as_str()),
+            Some("national_park" | "protected_area")
+        )
+    {
         return Some(("landuse", 8));
+    }
+    if matches!(natural, Some("peak" | "volcano" | "saddle")) {
+        return Some(("pois", 10));
     }
     if matches!(
         natural,
@@ -427,7 +537,13 @@ impl TileSource for GeneratedSource {
 pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<()> {
     let input = &args.input;
     let output = &args.output;
-    bail_unless_container(output)?;
+    let postgis_url = output
+        .to_str()
+        .filter(|o| o.starts_with("postgres://") || o.starts_with("postgresql://"))
+        .map(str::to_string);
+    if postgis_url.is_none() {
+        bail_unless_container(output)?;
+    }
     if args.minzoom > args.maxzoom || args.maxzoom > 15 {
         bail!(
             "invalid zoom range {}..={} (max supported: 15)",
@@ -435,9 +551,17 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
             args.maxzoom
         );
     }
-    info!(input = %input.display(), "pass 1/3: reading nodes");
-    let nodes = read_nodes(input)?;
-    info!(count = nodes.len(), "nodes indexed");
+    let workdir = match &args.workdir {
+        Some(d) => d.clone(),
+        None => std::env::temp_dir().join(format!("tiles-gen-{}", std::process::id())),
+    };
+    std::fs::create_dir_all(&workdir).context("create workdir")?;
+    let index_path = workdir.join("index.redb");
+    info!(input = %input.display(), index = %index_path.display(), "pass 1/3: reading nodes");
+    let index = DiskIndex::create(&index_path)?;
+    let node_count = read_nodes(input, &index)?;
+    index.finish_writes()?;
+    info!(count = node_count, "nodes indexed");
     info!("pass 2/3: reading relations");
     let rels = read_relations(input)?;
     let member_ways: HashSet<i64> = rels
@@ -452,7 +576,6 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
     info!("pass 3/3: reading ways");
 
     let mut features: Vec<Feature> = vec![];
-    let mut way_geoms: HashMap<i64, Vec<i64>> = HashMap::new();
     let mut bounds = [
         f64::INFINITY,
         f64::INFINITY,
@@ -467,7 +590,8 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
         let OsmObj::Way(way) = obj else { continue };
         let wid = way.id.0;
         if member_ways.contains(&wid) {
-            way_geoms.insert(wid, way.nodes.iter().map(|n| n.0).collect());
+            let packed: Vec<u8> = way.nodes.iter().flat_map(|n| n.0.to_le_bytes()).collect();
+            index.insert(MEMBER_WAYS_TABLE, wid as u64, &packed)?;
         }
         let Some((layer, mz)) = classify(&way.tags, is_area_way(&way)) else {
             continue;
@@ -475,8 +599,8 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
         let coords: Vec<Coord<f64>> = way
             .nodes
             .iter()
-            .filter_map(|n| nodes.get(&n.0))
-            .map(|&(lon, lat)| Coord { x: lon, y: lat })
+            .filter_map(|n| index.node(n.0))
+            .map(|(lon, lat)| Coord { x: lon, y: lat })
             .collect();
         if coords.len() < 2 {
             continue;
@@ -500,7 +624,19 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
             props: props_for(
                 &way.tags,
                 &[
-                    "name", "highway", "railway", "building", "natural", "landuse", "waterway",
+                    "name",
+                    "highway",
+                    "railway",
+                    "building",
+                    "natural",
+                    "landuse",
+                    "waterway",
+                    "boundary",
+                    "admin_level",
+                    "aeroway",
+                    "leisure",
+                    "tunnel",
+                    "bridge",
                 ],
             ),
         });
@@ -523,11 +659,18 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
             layer,
             minzoom: mz,
             geom: Geometry::Point(Point::new(lon, lat)),
-            props: props_for(&n.tags, &["name", "place", "amenity", "shop", "tourism"]),
+            props: props_for(
+                &n.tags,
+                &[
+                    "name", "place", "amenity", "shop", "tourism", "natural", "ele",
+                ],
+            ),
         });
     }
 
-    // Multipolygon relations.
+    // Multipolygon relations read the member-way table written in pass 3,
+    // so take a fresh read snapshot.
+    index.finish_writes()?;
     for rel in &rels {
         let Some((layer, mz)) = classify(&rel.tags, true) else {
             continue;
@@ -535,11 +678,11 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
         let mut outers: Vec<Vec<i64>> = vec![];
         let mut inners: Vec<Vec<i64>> = vec![];
         for (wid, role) in &rel.members {
-            if let Some(ids) = way_geoms.get(wid) {
+            if let Some(ids) = member_way(&index, *wid)? {
                 if role == "inner" {
-                    inners.push(ids.clone());
+                    inners.push(ids);
                 } else {
-                    outers.push(ids.clone());
+                    outers.push(ids);
                 }
             }
         }
@@ -550,11 +693,11 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
         }
         let mut inner_polys: Vec<LineString<f64>> = vec![];
         for ring in &inner_rings {
-            inner_polys.push(ring_to_linestring(ring, &nodes));
+            inner_polys.push(ring_to_linestring(ring, &index));
         }
         let mut polys = vec![];
         for ring in &outer_rings {
-            let ext = ring_to_linestring(ring, &nodes);
+            let ext = ring_to_linestring(ring, &index);
             let int: Vec<LineString<f64>> = inner_polys
                 .iter()
                 .filter(|inner| inner.0.first().is_some_and(|c| point_in_ring(*c, &ext)))
@@ -571,7 +714,15 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
             geom: Geometry::MultiPolygon(MultiPolygon(polys)),
             props: props_for(
                 &rel.tags,
-                &["name", "natural", "landuse", "waterway", "building"],
+                &[
+                    "name",
+                    "natural",
+                    "landuse",
+                    "waterway",
+                    "building",
+                    "boundary",
+                    "admin_level",
+                ],
             ),
         });
     }
@@ -579,6 +730,15 @@ pub async fn run_generate(args: GenerateArgs, runtime: &TilesRuntime) -> Result<
     info!(features = features.len(), "features extracted");
     if bounds[0] > bounds[2] {
         bail!("no usable features found in input");
+    }
+
+    if let Some(url) = &postgis_url {
+        info!(features = features.len(), "writing features to postgis");
+        write_postgis(&features, url).await?;
+        drop(index);
+        let _ = std::fs::remove_file(&index_path);
+        info!("postgis import done");
+        return Ok(());
     }
 
     let tiles = build_tiles(&features, args.minzoom, args.maxzoom)?;
@@ -631,19 +791,23 @@ fn grow(bounds: &mut [f64; 4], lon: f64, lat: f64) {
 
 fn bail_unless_container(output: &Path) -> Result<()> {
     match output.extension().and_then(|e| e.to_str()) {
-        Some("pmtiles" | "versatiles") => Ok(()),
-        other => bail!("output must end in .pmtiles or .versatiles (got {other:?})"),
+        Some("pmtiles" | "versatiles" | "mbtiles") => Ok(()),
+        other => bail!("output must end in .pmtiles, .versatiles, or .mbtiles (got {other:?})"),
     }
 }
 
-fn read_nodes(input: &Path) -> Result<HashMap<i64, (f64, f64)>> {
+fn read_nodes(input: &Path, index: &DiskIndex) -> Result<usize> {
     let file = BufReader::new(File::open(input)?);
     let mut pbf = OsmPbfReader::new(file);
-    let mut nodes = HashMap::new();
+    let mut count = 0usize;
     for obj in pbf.par_iter_nodes().filter_map(std::result::Result::ok) {
-        nodes.insert(obj.id.0, (obj.lon(), obj.lat()));
+        let mut v = [0u8; 8];
+        v[0..4].copy_from_slice(&obj.decimicro_lat.to_le_bytes());
+        v[4..8].copy_from_slice(&obj.decimicro_lon.to_le_bytes());
+        index.insert(NODES_TABLE, obj.id.0 as u64, &v)?;
+        count += 1;
     }
-    Ok(nodes)
+    Ok(count)
 }
 
 struct RelSpec {
@@ -675,13 +839,27 @@ fn read_relations(input: &Path) -> Result<Vec<RelSpec>> {
     Ok(rels)
 }
 
-fn ring_to_linestring(ring: &[i64], nodes: &HashMap<i64, (f64, f64)>) -> LineString<f64> {
+fn ring_to_linestring(ring: &[i64], index: &DiskIndex) -> LineString<f64> {
     LineString(
         ring.iter()
-            .filter_map(|id| nodes.get(id))
-            .map(|&(lon, lat)| Coord { x: lon, y: lat })
+            .filter_map(|id| index.node(*id))
+            .map(|(lon, lat)| Coord { x: lon, y: lat })
             .collect(),
     )
+}
+
+fn member_way(index: &DiskIndex, wid: i64) -> Result<Option<Vec<i64>>> {
+    let Some(bytes) = index.get(MEMBER_WAYS_TABLE, wid as u64)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+            .collect(),
+    ))
 }
 
 /// Ray casting point-in-polygon for inner ring assignment.
@@ -794,4 +972,171 @@ fn simplify(g: &Geometry<f64>, eps: f64) -> Geometry<f64> {
         Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify_vw(eps)),
         _ => g.clone(),
     }
+}
+
+// ==================== PostGIS output ====================
+
+/// Quote a single-quoted SQL literal.
+fn sql_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn wkt_coord(c: &Coord<f64>) -> String {
+    format!("{:.7} {:.7}", c.x, c.y)
+}
+
+/// Encode a geo::Geometry as WKT (features are lon/lat, EPSG:4326).
+fn wkt(g: &Geometry<f64>) -> Option<String> {
+    use geo::Geometry::*;
+    Some(match g {
+        Point(p) => format!("POINT({})", wkt_coord(&p.0)),
+        LineString(l) => {
+            let pts: Vec<String> = l.0.iter().map(wkt_coord).collect();
+            format!("LINESTRING({})", pts.join(","))
+        }
+        Polygon(p) => {
+            let mut rings = vec![
+                p.exterior()
+                    .0
+                    .iter()
+                    .map(wkt_coord)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ];
+            for i in p.interiors() {
+                rings.push(i.0.iter().map(wkt_coord).collect::<Vec<_>>().join(","));
+            }
+            format!(
+                "POLYGON({})",
+                rings
+                    .iter()
+                    .map(|r| format!("({r})"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        MultiPolygon(mp) => {
+            let polys: Vec<String> =
+                mp.0.iter()
+                    .map(|p| {
+                        let mut rings = vec![
+                            p.exterior()
+                                .0
+                                .iter()
+                                .map(wkt_coord)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        ];
+                        for i in p.interiors() {
+                            rings.push(i.0.iter().map(wkt_coord).collect::<Vec<_>>().join(","));
+                        }
+                        format!(
+                            "({})",
+                            rings
+                                .iter()
+                                .map(|r| format!("({r})"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    })
+                    .collect();
+            format!("MULTIPOLYGON({})", polys.join(","))
+        }
+        MultiLineString(ml) => {
+            let lines: Vec<String> =
+                ml.0.iter()
+                    .map(|l| {
+                        format!(
+                            "({})",
+                            l.0.iter().map(wkt_coord).collect::<Vec<_>>().join(",")
+                        )
+                    })
+                    .collect();
+            format!("MULTILINESTRING({})", lines.join(","))
+        }
+        _ => return None,
+    })
+}
+
+fn wkt_geom(g: &Geometry<f64>) -> Option<String> {
+    wkt(g)
+}
+
+/// Write features into a PostGIS database: one table per layer
+/// (tiles_<layer>) with (geom, kind, name, tags).
+async fn write_postgis(features: &[Feature], url: &str) -> Result<()> {
+    use std::collections::BTreeMap;
+    use tokio_postgres::NoTls;
+
+    let (client, conn) = tokio_postgres::connect(url, NoTls)
+        .await
+        .context("connect to postgres")?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            eprintln!("postgres connection error: {e}");
+        }
+    });
+
+    client
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS postgis; CREATE SCHEMA IF NOT EXISTS tiles;")
+        .await?;
+
+    let mut by_layer: BTreeMap<&str, Vec<&Feature>> = BTreeMap::new();
+    for f in features {
+        by_layer.entry(f.layer).or_default().push(f);
+    }
+
+    for (layer, feats) in by_layer {
+        let table = format!("tiles.{layer}");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table}(
+                   id bigserial primary key,
+                   geom geometry(Geometry,4326),
+                   name text,
+                   tags jsonb
+                 );"
+            ))
+            .await
+            .with_context(|| format!("create {table}"))?;
+
+        let mut written = 0usize;
+        for chunk in feats.chunks(500) {
+            let mut sql = String::from("INSERT INTO ");
+            sql.push_str(&table);
+            sql.push_str(" (geom,kind,name,tags) VALUES ");
+            for (i, f) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let geom = wkt_geom(&f.geom)
+                    .map(|w| format!("ST_GeomFromText({},4326)", sql_lit(&w)))
+                    .unwrap_or_else(|| "NULL".into());
+                let tags: serde_json::Map<String, serde_json::Value> = f
+                    .props
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                let name = tags
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(sql_lit)
+                    .unwrap_or_else(|| "NULL".into());
+                sql.push_str(&format!(
+                    "({geom},{name},{}::jsonb)",
+                    sql_lit(&serde_json::Value::Object(tags).to_string())
+                ));
+            }
+            client.batch_execute(&sql).await?;
+            written += chunk.len();
+        }
+        client
+            .batch_execute(&format!(
+                "CREATE INDEX IF NOT EXISTS {layer}_geom_gix ON {table} USING gist(geom);"
+            ))
+            .await?;
+        info!(layer, count = written, "postgis table written");
+    }
+    Ok(())
 }
