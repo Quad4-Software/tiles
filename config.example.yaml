@@ -3,11 +3,25 @@ server:
   port: 8080
   # public_url: https://tiles.example.com   # set when behind a proxy/CDN
   cache_max_age: 86400
+  # api_key: s3cret                          # require ?key= / Bearer / X-Api-Key
 
 sources:
   - name: osm
     src: /data/firenze.pmtiles
+    # style: /data/osm-style.json          # custom MapLibre style for /osm/style.json
   # - name: planet
   #   src: /data/osm.versatiles
   # - name: bucket-copy
   #   src: s3://my-bucket/osm.pmtiles        # uses AWS_* env vars
+
+# Upstream proxies: any spec containing {z}/{x}/{y} forwards tile requests.
+# Respect each provider's usage policy; this forwards real traffic.
+  # - name: topo
+  #   src: https://a.tile.opentopomap.org/{z}/{x}/{y}.png
+  # - name: rail
+  #   src: https://tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png
+  # - name: osmweb
+  #   src: https://tile.openstreetmap.org/{z}/{x}/{y}.png
+  #   headers:                               # sent to the upstream (auth etc)
+  #     - "Authorization: Bearer TOKEN"
+  #     - "User-Agent: my-proxy/1.0"
