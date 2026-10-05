@@ -134,9 +134,15 @@ cargo build --release
   only blobs whose stored length differs. PMTiles has no per-tile hash, so a
   rebuilt tile of identical length reads as unchanged; use `--full` to force a
   complete download.
-- Proxy sources (`{z}/{x}/{y}` in the spec) forward tile requests upstream
-  with status, content-type and ETag passthrough. Respect each provider's
-  usage policy.
+- Proxy sources (`{z}/{x}/{y}` in the spec) forward tile requests upstream.
+  A disk cache (`--cache-dir`, default ~/.cache/tiles) stores tiles with a
+  `.meta` sidecar: fresh entries serve locally, expired ones revalidate with
+  If-None-Match/If-Modified-Since (304 refreshes TTL without downloading),
+  upstream errors serve stale tiles, and concurrent misses on the same tile
+  collapse into one fetch. `--cache-ttl` sets the fallback TTL when upstream
+  sends no cache headers (default 7 days). Every response carries
+  `x-tiles-cache: hit|miss|stale|revalidated`. Respect each provider's usage
+  policy.
 - `generate` layers are
   water, landuse, natural, roads, transit, aeroway, buildings, boundaries
   (admin levels), places, pois. Multipolygon and boundary relations are
