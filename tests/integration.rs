@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use object_store::ObjectStoreExt;
 use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
@@ -93,6 +93,8 @@ async fn serves_local_versatiles() {
         3600,
         None,
         None,
+        None,
+        0,
     )
     .await
     .unwrap();
@@ -140,6 +142,8 @@ async fn serves_local_pmtiles() {
         3600,
         None,
         None,
+        None,
+        0,
     )
     .await
     .unwrap();
@@ -197,7 +201,7 @@ async fn serves_remote_pmtiles_over_http() {
     let url = format!("{base}/fixture.pmtiles");
     assert!(source::supports_remote_extension(&url));
 
-    let state = server::build_state(&[named("remote", &url)], &runtime, 60, None, None)
+    let state = server::build_state(&[named("remote", &url)], &runtime, 60, None, None, None, 0)
         .await
         .unwrap();
     let app = server::router(state);
@@ -435,6 +439,8 @@ async fn api_key_auth() {
         60,
         None,
         Some("secret".into()),
+        None,
+        0,
     )
     .await
     .unwrap();
@@ -470,4 +476,91 @@ async fn api_key_auth() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Proxy cache: second request is a disk hit, expired entries revalidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_cache_hit_and_revalidate() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // mini upstream counting GETs, ETag + max-age=0 (immediate revalidate)
+    let hits = Arc::new(AtomicUsize::new(0));
+    let revalidated = Arc::new(AtomicUsize::new(0));
+    let h2 = hits.clone();
+    let r2 = revalidated.clone();
+    let app = axum::Router::new()
+        .route(
+            "/t/{*rest}",
+            axum::routing::get(
+                |axum::extract::State((hits, revalidated)): axum::extract::State<(
+                    Arc<AtomicUsize>,
+                    Arc<AtomicUsize>,
+                )>,
+                 headers: HeaderMap| async move {
+                    if headers
+                        .get(axum::http::header::IF_NONE_MATCH)
+                        .and_then(|v| v.to_str().ok())
+                        == Some("\"v1\"")
+                    {
+                        revalidated.fetch_add(1, Ordering::SeqCst);
+                        return axum::response::Response::builder()
+                            .status(304)
+                            .header("cache-control", "max-age=0")
+                            .body(axum::body::Body::empty())
+                            .unwrap();
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "image/png")
+                        .header("etag", "\"v1\"")
+                        .header("cache-control", "max-age=0")
+                        .body(axum::body::Body::from(b"PNG".to_vec()))
+                        .unwrap()
+                },
+            ),
+        )
+        .with_state((h2, r2));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = common::test_runtime();
+    let mut src = named(
+        "m",
+        &format!("http://127.0.0.1:{port}/t/{{z}}/{{x}}/{{y}}.png"),
+    );
+    let state = server::build_state(
+        std::slice::from_mut(&mut src),
+        &runtime,
+        60,
+        None,
+        None,
+        Some(dir.path().join("cache")),
+        0,
+    )
+    .await
+    .unwrap();
+    let app = server::router(state);
+
+    let (s, h, b1) = get(app.clone(), "/m/1/1/1.png", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-tiles-cache").unwrap(), "miss");
+    assert_eq!(b1, b"PNG");
+
+    // within TTL (clamped to >=1s): disk hit, no upstream request
+    let (s, h, _) = get(app.clone(), "/m/1/1/1.png", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(h.get("x-tiles-cache").unwrap(), "hit");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "still one upstream hit");
+
+    // past TTL: conditional revalidation -> 304 refreshes, no re-download
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let (s, h, b2) = get(app.clone(), "/m/1/1/1.png", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b2, b"PNG");
+    assert_eq!(h.get("x-tiles-cache").unwrap(), "revalidated");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "upstream hit once");
+    assert_eq!(revalidated.load(Ordering::SeqCst), 1, "one conditional GET");
 }
