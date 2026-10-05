@@ -26,6 +26,8 @@ fn named(name: &str, spec: &str) -> NamedSource {
     NamedSource {
         name: name.into(),
         spec: spec.into(),
+        style: None,
+        headers: vec![],
     }
 }
 
@@ -90,6 +92,7 @@ async fn serves_local_versatiles() {
         &runtime,
         3600,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -135,6 +138,7 @@ async fn serves_local_pmtiles() {
         &[named("pm", fixture.to_str().unwrap())],
         &runtime,
         3600,
+        None,
         None,
     )
     .await
@@ -193,7 +197,7 @@ async fn serves_remote_pmtiles_over_http() {
     let url = format!("{base}/fixture.pmtiles");
     assert!(source::supports_remote_extension(&url));
 
-    let state = server::build_state(&[named("remote", &url)], &runtime, 60, None)
+    let state = server::build_state(&[named("remote", &url)], &runtime, 60, None, None)
         .await
         .unwrap();
     let app = server::router(state);
@@ -313,6 +317,7 @@ async fn generate_osm_pbf_to_pmtiles() {
             output: output.clone(),
             minzoom: 0,
             maxzoom: 14,
+            workdir: Some(tmp.path().join("workdir")),
         },
         &common::test_runtime(),
     )
@@ -336,4 +341,133 @@ async fn generate_osm_pbf_to_pmtiles() {
             .len()
             > 100
     );
+}
+
+/// Delta-update a local pmtiles from a newer file: generate two versions,
+/// run update, and verify the result serves the new file's tile set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn update_pmtiles_delta() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = std::path::Path::new("tests/testdata/monaco.osm.pbf").to_path_buf();
+    if !input.exists() {
+        return;
+    }
+    let old_path = tmp.path().join("old.pmtiles");
+    let new_path = tmp.path().join("new.pmtiles");
+    let runtime = common::test_runtime();
+
+    tiles::generate::run_generate(
+        tiles::generate::GenerateArgs {
+            input: input.clone(),
+            output: old_path.clone(),
+            minzoom: 0,
+            maxzoom: 13,
+            workdir: Some(tmp.path().join("w1")),
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+    tiles::generate::run_generate(
+        tiles::generate::GenerateArgs {
+            input,
+            output: new_path.clone(),
+            minzoom: 0,
+            maxzoom: 14,
+            workdir: Some(tmp.path().join("w2")),
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let updated = tmp.path().join("updated.pmtiles");
+    tiles::update::run_update(
+        tiles::update::UpdateArgs {
+            remote: new_path.to_str().unwrap().to_string(),
+            http: tiles::http::HttpOpts::default(),
+            local: old_path.clone(),
+            output: Some(updated.clone()),
+            full: false,
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let reader = tiles::source::open(updated.to_str().unwrap(), &runtime)
+        .await
+        .unwrap();
+    let tj: serde_json::Value = serde_json::from_str(&reader.tilejson().stringify()).unwrap();
+    assert_eq!(tj["maxzoom"], 14);
+
+    // A z14 tile present only in the new file must be served.
+    let coord = TileCoord::new(14, 8529, 5973).unwrap();
+    let tile = reader.tile(&coord).await.unwrap().expect("z14 tile");
+    assert!(
+        tile.into_blob(&TileCompression::Uncompressed)
+            .unwrap()
+            .len()
+            > 100
+    );
+}
+
+/// Proxy source specs (upstream tile templates) are detected from {z}/{x}/{y}.
+#[test]
+fn proxy_template_detection() {
+    assert!(source::is_proxy_template(
+        "https://a.tile.opentopomap.org/{z}/{x}/{y}.png"
+    ));
+    assert!(!source::is_proxy_template("https://x.com/map.pmtiles"));
+    assert!(!source::is_proxy_template("/data/map.versatiles"));
+}
+
+/// API-key auth: everything except /health is protected, and the key works
+/// via ?key=, Bearer, or X-Api-Key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn api_key_auth() {
+    let tmp = TempDir::new().unwrap();
+    let fixture = common::write_fixture(tmp.path(), "pmtiles").await;
+    let runtime = common::test_runtime();
+    let state = server::build_state(
+        &[named("osm", fixture.to_str().unwrap())],
+        &runtime,
+        60,
+        None,
+        Some("secret".into()),
+    )
+    .await
+    .unwrap();
+    let app = server::router(state);
+
+    // health open
+    let (s, _, _) = get(app.clone(), "/health", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    // everything else closed
+    for path in ["/", "/osm/tilejson.json", "/osm/0/0/0.pbf", "/osm/view"] {
+        let (s, _, _) = get(app.clone(), path, "gzip").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // query param works, and generated urls carry the key
+    let (s, _, body) = get(app.clone(), "/osm/tilejson.json?key=secret", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    let tj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(tj["tiles"][0].as_str().unwrap().contains("key=secret"));
+    // bearer + x-api-key
+    let req = Request::builder()
+        .uri("/osm/0/0/0.pbf")
+        .header(header::HOST, "tiles.test")
+        .header(header::AUTHORIZATION, "Bearer secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let req = Request::builder()
+        .uri("/osm/tilejson.json")
+        .header(header::HOST, "tiles.test")
+        .header("x-api-key", "secret")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
