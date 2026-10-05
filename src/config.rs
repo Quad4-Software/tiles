@@ -41,6 +41,12 @@ pub struct ServerConfig {
     /// Optional API key protecting every route except /health.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Proxy tile cache directory (enabled when proxy sources exist).
+    #[serde(default)]
+    pub cache_dir: Option<std::path::PathBuf>,
+    /// Fallback TTL seconds for proxied tiles.
+    #[serde(default)]
+    pub cache_ttl: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +57,8 @@ impl Default for ServerConfig {
             public_url: None,
             cache_max_age: default_cache_max_age(),
             api_key: None,
+            cache_dir: None,
+            cache_ttl: None,
         }
     }
 }

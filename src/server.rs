@@ -62,6 +62,8 @@ pub struct AppState {
     /// Optional API key. When set, every route except /health requires
     /// ?key=<key>, an "Authorization: Bearer" header, or an "X-Api-Key" header.
     pub api_key: Option<String>,
+    /// Disk cache for proxy sources; None disables caching.
+    pub cache: Option<Arc<crate::cache::ProxyCache>>,
 }
 
 /// Open every configured source up front, so bad specs fail fast at startup.
@@ -71,6 +73,8 @@ pub async fn build_state(
     cache_max_age: u32,
     public_url: Option<String>,
     api_key: Option<String>,
+    cache_dir: Option<std::path::PathBuf>,
+    cache_ttl_secs: u64,
 ) -> Result<AppState> {
     let mut sources = HashMap::new();
     for def in defs {
@@ -166,6 +170,12 @@ pub async fn build_state(
         public_url,
         runtime: runtime.clone(),
         api_key,
+        cache: cache_dir.map(|d| {
+            Arc::new(crate::cache::ProxyCache::new(
+                d,
+                std::time::Duration::from_secs(cache_ttl_secs),
+            ))
+        }),
     })
 }
 
@@ -528,6 +538,9 @@ async fn tile(
 }
 
 /// Forward a tile request to an upstream provider's tile endpoint.
+/// With a cache configured: serve fresh disk hits, revalidate expired
+/// entries conditionally, serve stale on upstream errors, and collapse
+/// concurrent misses on the same tile into one upstream fetch.
 async fn proxy_tile(
     state: &AppState,
     proxy: &ProxySpec,
@@ -540,9 +553,127 @@ async fn proxy_tile(
         .replace("{z}", &coord.level.to_string())
         .replace("{x}", &coord.x.to_string())
         .replace("{y}", &coord.y.to_string());
+    let ext = proxy.extensions[0].as_str();
+    let key = format!(
+        "{}/{}/{}/{}.{}",
+        entry.name, coord.level, coord.x, coord.y, ext
+    );
+
+    let Some(cache) = &state.cache else {
+        return proxy_fetch(state, proxy, entry, &url, None).await;
+    };
+
+    // Fast path: fresh on disk.
+    if let Some(hit) = cache.fresh(&key) {
+        return proxy_response(&hit.body, &hit.meta, "hit", state);
+    }
+
+    let m = cache.lock_arc(&key);
+    let _guard = m.lock().await;
+    // Recheck: another request may have filled the cache while we waited.
+    if let Some(hit) = cache.fresh(&key) {
+        drop(_guard);
+        cache.unlock_cleanup(&key, &m);
+        return proxy_response(&hit.body, &hit.meta, "hit", state);
+    }
+    let stale = cache.stale(&key);
+    let out = proxy_fetch_cached(state, proxy, entry, &url, &key, stale).await;
+    drop(_guard);
+    cache.unlock_cleanup(&key, &m);
+    out
+}
+
+fn proxy_response(
+    body: &[u8],
+    meta: &crate::cache::TileMeta,
+    hit: &str,
+    _state: &AppState,
+) -> Result<Response, StatusCode> {
+    let remaining = meta.expires_at.saturating_sub(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, meta.content_type.clone())
+        .header(header::CONTENT_LENGTH, body.len())
+        .header(
+            header::CACHE_CONTROL,
+            format!("public, max-age={remaining}"),
+        )
+        .header("x-tiles-cache", hit)
+        .body(axum::body::Body::from(body.to_vec()))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Cache-aware upstream fetch: conditional request when we have a stale
+/// entry, 304 refreshes TTL, upstream failure falls back to stale.
+async fn proxy_fetch_cached(
+    state: &AppState,
+    proxy: &ProxySpec,
+    entry: &ServerSource,
+    url: &str,
+    key: &str,
+    stale: Option<crate::cache::CachedTile>,
+) -> Result<Response, StatusCode> {
+    let cache = state.cache.as_ref().unwrap();
+    let mut req = proxy.client.get(url);
+    if let Some(s) = &stale {
+        if let Some(e) = &s.meta.etag {
+            req = req.header(header::IF_NONE_MATCH, e);
+        }
+        if let Some(lm) = &s.meta.last_modified {
+            req = req.header(header::IF_MODIFIED_SINCE, lm);
+        }
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(_) => {
+            return match stale {
+                Some(s) => proxy_response(&s.body, &s.meta, "stale", state),
+                None => Err(StatusCode::BAD_GATEWAY),
+            };
+        }
+    };
+    if resp.status() == StatusCode::NOT_MODIFIED
+        && let Some(s) = stale
+    {
+        let ttl = crate::cache::ttl_from(resp.headers(), cache.default_ttl());
+        let _ = cache.touch(key, ttl);
+        return proxy_response(&s.body, &s.meta, "revalidated", state);
+    }
+    if !resp.status().is_success() {
+        return match &stale {
+            Some(s) => proxy_response(&s.body, &s.meta, "stale", state),
+            None => {
+                Err(StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+            }
+        };
+    }
+    let ttl = crate::cache::ttl_from(resp.headers(), cache.default_ttl());
+    let meta = crate::cache::TileMeta::from_response(&resp, &entry.mime, ttl);
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?
+        .to_vec();
+    let _ = cache.store(key, &body, &meta);
+    proxy_response(&body, &meta, "miss", state)
+}
+
+/// Direct passthrough when no cache is configured.
+async fn proxy_fetch(
+    state: &AppState,
+    proxy: &ProxySpec,
+    entry: &ServerSource,
+    url: &str,
+    _unused: Option<()>,
+) -> Result<Response, StatusCode> {
     let resp = proxy
         .client
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
