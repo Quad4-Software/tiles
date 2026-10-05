@@ -146,10 +146,9 @@ pub async fn mirror(
     filter: Option<&str>,
     limit: Option<usize>,
     dry_run: bool,
+    opts: &crate::http::HttpOpts,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("tiles/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    let client = opts.client(None)?;
     let mut files = catalog(provider, &client).await?;
     if let Some(f) = filter {
         files.retain(|r| r.name.contains(f));

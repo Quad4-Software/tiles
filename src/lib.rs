@@ -7,8 +7,10 @@
 pub mod config;
 pub mod fetch;
 pub mod generate;
+pub mod http;
 pub mod mirror;
 pub mod s3;
 pub mod server;
 pub mod source;
+pub mod update;
 pub mod viewer;

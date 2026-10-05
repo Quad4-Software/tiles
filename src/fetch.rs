@@ -23,6 +23,7 @@ const CONTAINER_EXTS: &[&str] = &["versatiles", "pmtiles", "mbtiles", "tar"];
 
 #[derive(Debug, Default)]
 pub struct FetchOptions {
+    pub http: crate::http::HttpOpts,
     pub geo_bbox: Option<GeoBBox>,
     pub level_min: Option<u8>,
     pub level_max: Option<u8>,
@@ -73,7 +74,7 @@ pub async fn fetch(
     };
 
     if !filtered && !format_change && !src_is_dir {
-        raw_copy(src, dst).await
+        raw_copy(src, dst, opts).await
     } else if opts.raw {
         bail!("--raw cannot be combined with filters, directories, or format conversion")
     } else {
@@ -82,12 +83,12 @@ pub async fn fetch(
 }
 
 /// One pass over the object, no decoding: byte-identical copy.
-async fn raw_copy(src: &str, dst: &Path) -> Result<()> {
+async fn raw_copy(src: &str, dst: &Path, opts: &FetchOptions) -> Result<()> {
     if s3::is_s3_uri(src) {
         return s3_copy(src, dst).await;
     }
     if src.starts_with("http://") || src.starts_with("https://") {
-        return http_copy(src, dst).await;
+        return http_copy(src, dst, &opts.http).await;
     }
     tokio::fs::copy(src, dst)
         .await
@@ -118,8 +119,8 @@ async fn s3_copy(src: &str, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn http_copy(src: &str, dst: &Path) -> Result<()> {
-    let client = reqwest::Client::new();
+async fn http_copy(src: &str, dst: &Path, opts: &crate::http::HttpOpts) -> Result<()> {
+    let client = opts.client(None)?;
     let resp = client
         .get(src)
         .send()
@@ -155,7 +156,21 @@ async fn convert_copy(
     opts: &FetchOptions,
     runtime: &TilesRuntime,
 ) -> Result<()> {
-    let reader = source::open(src, runtime).await?;
+    let reader =
+        if (src.starts_with("http://") || src.starts_with("https://")) && !opts.http.is_empty() {
+            let ext = src
+                .split(['?', '#'])
+                .next()
+                .unwrap_or(src)
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let r = crate::http::AuthedHttpReader::new(src.to_string(), &opts.http)?;
+            source::open_reader(Box::new(r), &ext, src, runtime).await?
+        } else {
+            source::open(src, runtime).await?
+        };
 
     let mut pyramid = TilePyramid::new_full();
     if let Some(b) = &opts.geo_bbox {
