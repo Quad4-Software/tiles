@@ -4,6 +4,8 @@ server:
   # public_url: https://tiles.example.com   # set when behind a proxy/CDN
   cache_max_age: 86400
   # api_key: s3cret                          # require ?key= / Bearer / X-Api-Key
+  # cache_dir: /var/cache/tiles              # proxy tile cache (default ~/.cache/tiles)
+  # cache_ttl: 604800                        # fallback TTL secs when upstream sends none
 
 sources:
   - name: osm

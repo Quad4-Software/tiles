@@ -1,11 +1,23 @@
 # tiles
 
-Fast, self-hosted map tile server and fetcher in Rust. One static-ish binary
-serves PMTiles and VersaTiles containers from local disk, HTTP(S) URLs, or S3,
-with no external services and no third-party requests from the browser.
+Fast, self-hosted map tile platform in Rust. One static-ish binary serves,
+fetches, generates, updates, mirrors, and proxies map tiles — PMTiles,
+VersaTiles, MBTiles — from local disk, HTTP(S), or S3, with no external
+services and no third-party requests from the browser.
 
 Built on [versatiles-rs](https://github.com/versatiles-org/versatiles-rs)
 (`versatiles_container` 4.15) for container I/O and axum for HTTP.
+
+## Install
+
+```sh
+# prebuilt binary from GitHub releases
+curl -sL https://github.com/Quad4-Software/tiles/releases/latest/download/tiles-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+./tiles serve --source osm=map.pmtiles
+```
+
+Or build from source: `cargo build --release` (Rust stable, edition 2024),
+or use the Containerfile (below).
 
 ## Features
 
@@ -13,15 +25,37 @@ Built on [versatiles-rs](https://github.com/versatiles-org/versatiles-rs)
   (`.mbtiles`/`.tar` local-only: they need a real file)
 - Sources: local path, `http(s)://` (byte-range reads), `s3://bucket/key`
 - `fetch` downloads remote containers or extracts a bbox/zoom subset
-- `generate` builds vector tiles from `.osm.pbf` files (Geofabrik extracts)
+- `generate` builds vector tiles from `.osm.pbf` files into `.pmtiles`,
+  `.versatiles`, `.mbtiles`, or a PostGIS database. Node/way indexes are
+  disk-backed (redb), so RAM stays flat on large extracts
+- `update` refreshes a local `.pmtiles` from a newer remote build by
+  downloading only changed tiles (directory diff over range requests)
 - `mirror` bulk-downloads every file a provider publishes (Geofabrik,
   VersaTiles, Protomaps), skipping files already on disk
-- Zero-copy serving: tiles keep their stored compression (gzip/brotli) when
-  the client accepts it, recompressing on the fly only when needed; ETag +
-  If-None-Match returns 304 for unchanged tiles
-- TileJSON, a generated MapLibre style, and a built-in viewer with vendored
-  MapLibre assets: the browser never touches a CDN
-- YAML config or pure CLI flags
+- Upstream proxies: any source whose spec is a `{z}/{x}/{y}` URL template
+  forwards tile requests, with a disk cache (TTL from upstream headers,
+  conditional revalidation, stale-if-error, fetch coalescing)
+- Optional API-key auth on every route but `/health` (`?key=`, Bearer, or
+  X-Api-Key); outbound auth (headers, basic, bearer, api-key, user-agent)
+  for fetch/mirror/update and proxy upstreams
+- Custom MapLibre styles per source (`--style`/`style:`), or a generated
+  fill/line/circle style; built-in viewer with vendored MapLibre assets —
+  the browser never touches a CDN
+- Zero-copy serving: tiles keep stored compression (gzip/brotli) when the
+  client accepts it; ETag + If-None-Match returns 304 for unchanged tiles
+- YAML config, CLI flags, or env vars (`TILES_*`)
+
+## Environment variables
+
+| Var | Effect |
+|---|---|
+| `TILES_HOST`, `TILES_PORT`, `TILES_PUBLIC_URL` | serve bind + public URL |
+| `TILES_API_KEY` | inbound API key |
+| `TILES_CACHE_DIR`, `TILES_CACHE_TTL` | proxy cache dir + fallback TTL |
+| `TILES_HTTP_HEADER`, `TILES_USER_AGENT` | outbound headers/UA (fetch/mirror/update) |
+| `TILES_BASIC_AUTH`, `TILES_BEARER`, `TILES_API_KEY_HEADER` | outbound auth |
+| `AWS_*` | S3 credentials (below) |
+| `RUST_LOG` | log level filter (default `info`) |
 
 ## Usage
 
@@ -98,7 +132,7 @@ AWS_ALLOW_HTTP=true # for non-TLS endpoints
 
 Multi-stage `Containerfile`: pinned Rust build stage, distroless
 `cc-debian12:nonroot` runtime (no shell, no package manager, uid 65532).
-Final image is about 49 MB.
+Final image is about 51 MB.
 
 ```sh
 podman build -t tiles -f Containerfile .
@@ -113,9 +147,13 @@ Or drop a `config.yaml` into the data dir (the default CMD reads
 
 ```sh
 cargo test          # unit + integration tests (local, s3-mock, http-mock)
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt, strict clippy, and tests on every
+push; pushing a `v*` tag builds the release binary and publishes it with a
+sha256 automatically.
 
 ## Notes
 
