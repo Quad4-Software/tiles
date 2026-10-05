@@ -38,6 +38,9 @@ pub struct ServerConfig {
     pub public_url: Option<String>,
     #[serde(default = "default_cache_max_age")]
     pub cache_max_age: u32,
+    /// Optional API key protecting every route except /health.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -47,6 +50,7 @@ impl Default for ServerConfig {
             port: default_port(),
             public_url: None,
             cache_max_age: default_cache_max_age(),
+            api_key: None,
         }
     }
 }
@@ -65,6 +69,13 @@ fn default_cache_max_age() -> u32 {
 pub struct ConfigSource {
     pub name: String,
     pub src: String,
+    /// Optional path to a custom style.json served at /{name}/style.json.
+    #[serde(default)]
+    pub style: Option<std::path::PathBuf>,
+    /// Extra headers sent to the upstream (proxy sources only), as
+    /// "Name: value" strings.
+    #[serde(default)]
+    pub headers: Vec<String>,
 }
 
 impl Config {
@@ -81,6 +92,8 @@ impl Config {
             .map(|s| NamedSource {
                 name: s.name.clone(),
                 spec: s.src.clone(),
+                style: s.style.clone(),
+                headers: s.headers.clone(),
             })
             .collect()
     }

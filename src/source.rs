@@ -32,7 +32,7 @@ fn extension_of(spec: &str) -> Result<String> {
 
 /// Open a container from a remote `DataReader` (http/s3/blob), dispatching on
 /// the file extension the same way the container registry does.
-async fn open_from_reader(
+pub async fn open_reader(
     reader: versatiles_core::io::DataReader,
     extension: &str,
     spec: &str,
@@ -53,7 +53,7 @@ pub async fn open(spec: &str, runtime: &TilesRuntime) -> Result<SharedTileSource
     if s3::is_s3_uri(spec) {
         let ext = extension_of(spec)?;
         let reader = s3::s3_data_reader(spec)?;
-        return open_from_reader(reader, &ext, spec, runtime)
+        return open_reader(reader, &ext, spec, runtime)
             .await
             .with_context(|| format!("failed to open '{spec}'"));
     }
@@ -67,10 +67,14 @@ pub async fn open(spec: &str, runtime: &TilesRuntime) -> Result<SharedTileSource
 }
 
 /// A `name=spec` pair as accepted by `--source` and the config file.
+/// `style` optionally points to a custom MapLibre style JSON file.
 #[derive(Debug, Clone)]
 pub struct NamedSource {
     pub name: String,
     pub spec: String,
+    pub style: Option<std::path::PathBuf>,
+    /// Extra headers sent to upstream (proxy sources only).
+    pub headers: Vec<String>,
 }
 
 impl std::str::FromStr for NamedSource {
@@ -87,8 +91,16 @@ impl std::str::FromStr for NamedSource {
         Ok(Self {
             name: name.to_string(),
             spec: spec.trim().to_string(),
+            style: None,
+            headers: vec![],
         })
     }
+}
+
+/// A source spec containing `{z}`/`{x}`/`{y}` placeholders is an upstream
+/// tile proxy template, not a container.
+pub fn is_proxy_template(spec: &str) -> bool {
+    spec.contains("{z}") && spec.contains("{x}") && spec.contains("{y}")
 }
 
 /// Convenience used by tests: open a remote container only when the format

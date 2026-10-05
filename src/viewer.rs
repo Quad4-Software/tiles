@@ -3,33 +3,54 @@
 
 use std::collections::HashMap;
 
-use crate::server::ServerSource;
+use crate::server::{Backend, ServerSource};
 
 pub const MAPLIBRE_JS: &[u8] = include_bytes!("../assets/maplibre-gl.js");
 pub const MAPLIBRE_CSS: &[u8] = include_bytes!("../assets/maplibre-gl.css");
 
 const PAGE_CSS: &str = "html,body,#map{height:100%;margin:0;padding:0}";
 
-pub fn index_html(sources: &HashMap<String, ServerSource>, base: &str) -> String {
+pub fn index_html(sources: &HashMap<String, ServerSource>, base: &str, qs: &str) -> String {
     let mut rows: Vec<_> = sources.values().collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     let items: String = rows
         .iter()
         .map(|s| {
+            let kind = match &s.backend {
+                Backend::Proxy(_) => "proxy",
+                _ if s.mime.starts_with("image/") => "raster",
+                _ => "vector",
+            };
             format!(
-                "<li><strong>{n}</strong>: <a href=\"/{n}/view\">view</a> \
-				 &middot; <a href=\"/{n}/tilejson.json\">tilejson</a> \
-				 &middot; tiles <code>{base}/{n}/{{z}}/{{x}}/{{y}}.{e}</code></li>",
+                "<div class=card><div class=head><span class=name>{n}</span>				 <span class=badge>{kind}</span><span class=badge>{e}</span></div>				 <div class=links><a href=\"/{n}/view{qs}\">view</a>				 <a href=\"/{n}/tilejson.json{qs}\">tilejson</a>				 <a href=\"/{n}/style.json{qs}\">style</a></div>				 <code class=url>{base}/{n}/{{z}}/{{x}}/{{y}}.{e}</code></div>",
                 n = s.name,
                 e = s.extensions[0],
             )
         })
         .collect();
     format!(
-        "<!doctype html><meta charset=utf-8><title>tiles</title>\
-		 <style>body{{font-family:system-ui,sans-serif;max-width:60em;margin:3em auto;padding:0 1em}}\
-		 code{{background:#eee;padding:0 .2em}}</style>\
-		 <h1>tiles</h1><ul>{items}</ul>"
+        r#"<!doctype html><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>tiles</title><style>
+:root{{--bg:#f6f7f8;--fg:#1c1f22;--mut:#6b7280;--line:#e2e5e8;--card:#fff;--acc:#2f6feb}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#0f1214;--fg:#e4e7ea;--mut:#8b949c;--line:#262b30;--card:#171b1f;--acc:#6ea8fe}}}}
+*{{box-sizing:border-box}}
+body{{font:15px/1.5 system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);max-width:56rem;margin:0 auto;padding:3rem 1.25rem}}
+h1{{font-size:1.5rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .4rem}}
+.sub{{color:var(--mut);margin:0 0 2rem}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem 1.25rem;margin-bottom:.75rem}}
+.head{{display:flex;align-items:baseline;gap:.5rem;margin-bottom:.4rem}}
+.name{{font-weight:600}}
+.badge{{font:11px/1 ui-monospace,monospace;color:var(--mut);border:1px solid var(--line);border-radius:99px;padding:.2rem .55rem}}
+.links{{display:flex;gap:1rem;margin:.3rem 0 .5rem}}
+a{{color:var(--acc);text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.url{{display:block;font:12px/1.6 ui-monospace,monospace;color:var(--mut);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.35rem .6rem;overflow-x:auto;white-space:nowrap}}
+</style>
+<h1>tiles</h1><p class=sub>{count} source{sfx} serving on this instance.</p>
+{items}"#,
+        count = rows.len(),
+        sfx = if rows.len() == 1 { "" } else { "s" },
     )
 }
 
@@ -48,16 +69,16 @@ pub fn view_html(name: &str) -> String {
 		 window.onerror=function(m,s,l,c){{err(m+' @'+s+':'+l+':'+c)}};\
 		 function stat(){{\
 		 Promise.all([\
-		 fetch('/{name}/tilejson.json').then(r=>r.status),\
-		 fetch('/{name}/style.json').then(r=>r.status),\
-		 fetch('/{name}/0/0/0.pbf').then(r=>r.status+' '+r.headers.get('content-length')+'B')\
+		 fetch('/{name}/tilejson.json'+location.search).then(r=>r.status),\
+		 fetch('/{name}/style.json'+location.search).then(r=>r.status),\
+		 fetch('/{name}/0/0/0.pbf'+location.search).then(r=>r.status+' '+r.headers.get('content-length')+'B')\
 		 ]).then(function(x){{var d=document.createElement('div');d.id='stat';\
 		 d.textContent='tilejson '+x[0]+' | style '+x[1]+' | tile '+x[2];\
 		 document.body.appendChild(d)}})}}\
 		 stat();\
 		 if(typeof maplibregl==='undefined'){{err('maplibre-gl.js failed to load')}}\
 		 else{{try{{var map=new maplibregl.Map({{container:'map',\
-		 style:'/{name}/style.json',hash:true,\
+		 style:'/{name}/style.json'+location.search,hash:true,\
 		 attributionControl:{{compact:true}}}});\
 		 map.addControl(new maplibregl.NavigationControl());\
 		 map.addControl(new maplibregl.ScaleControl());\
