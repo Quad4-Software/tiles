@@ -14,7 +14,7 @@ GL JS: the browser makes no third-party requests.
 
 ```sh
 # prebuilt x86_64 Linux binary (see Releases for the current tag)
-curl -sL https://github.com/Quad4-Software/tiles/releases/download/v0.2.0/tiles-v0.2.0-x86_64-unknown-linux-gnu.tar.gz | tar xz
+curl -sL https://github.com/Quad4-Software/tiles/releases/download/v0.2.1/tiles-v0.2.1-x86_64-unknown-linux-gnu.tar.gz | tar xz
 
 cargo build --release        # or build from source
 ```
