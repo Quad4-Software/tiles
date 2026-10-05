@@ -46,6 +46,7 @@ versatiles_geometry = "4.15"
 redb = "4.3"
 tokio-postgres = "0.7"
 base64 = "0.22"
+httpdate = "1"
 
 [dev-dependencies]
 tempfile = "3"

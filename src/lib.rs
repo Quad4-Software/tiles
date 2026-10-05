@@ -4,6 +4,7 @@
 //! from a single binary: tiles, TileJSON, a generated style, and a vendored
 //! MapLibre viewer, so a browser never talks to a third party.
 
+pub mod cache;
 pub mod config;
 pub mod fetch;
 pub mod generate;

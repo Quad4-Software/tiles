@@ -64,6 +64,14 @@ enum Cmd {
         /// it as ?key=, "Authorization: Bearer", or "X-Api-Key".
         #[arg(long, value_name = "KEY", env = "TILES_API_KEY")]
         api_key: Option<String>,
+        /// Directory for the proxy tile cache. Default: $XDG_CACHE_HOME/tiles.
+        /// Proxies are uncached if unset and the dir cannot be created.
+        #[arg(long, value_name = "DIR", env = "TILES_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
+        /// Fallback TTL (seconds) for proxied tiles when upstream sends no
+        /// cache headers. Default: 604800 (7 days).
+        #[arg(long, value_name = "SECS", env = "TILES_CACHE_TTL")]
+        cache_ttl: Option<u64>,
     },
     /// Download a remote container, or extract a subset.
     Fetch {
@@ -202,6 +210,8 @@ async fn main() -> Result<()> {
             style,
             upstream_header,
             api_key,
+            cache_dir,
+            cache_ttl,
         } => {
             serve(ServeOpts {
                 config,
@@ -213,6 +223,8 @@ async fn main() -> Result<()> {
                 cli_styles: style,
                 cli_upstream_headers: upstream_header,
                 api_key,
+                cache_dir,
+                cache_ttl,
             })
             .await
         }
@@ -333,6 +345,8 @@ struct ServeOpts {
     cli_styles: Vec<String>,
     cli_upstream_headers: Vec<String>,
     api_key: Option<String>,
+    cache_dir: Option<PathBuf>,
+    cache_ttl: Option<u64>,
 }
 
 async fn serve(o: ServeOpts) -> Result<()> {
@@ -346,6 +360,8 @@ async fn serve(o: ServeOpts) -> Result<()> {
         cli_styles,
         cli_upstream_headers,
         api_key,
+        cache_dir,
+        cache_ttl,
     } = o;
     let cfg = config
         .as_deref()
@@ -386,7 +402,34 @@ async fn serve(o: ServeOpts) -> Result<()> {
     }
 
     let runtime = TilesRuntime::builder().silent_progress(true).build();
-    let state = server::build_state(&sources, &runtime, cache_max_age, public_url, api_key).await?;
+    let any_proxy = sources
+        .iter()
+        .any(|s| tiles::source::is_proxy_template(&s.spec));
+    let cache_dir = if any_proxy {
+        Some(
+            cache_dir
+                .or(cfg.server.cache_dir)
+                .unwrap_or_else(tiles::cache::ProxyCache::default_dir),
+        )
+    } else {
+        None
+    };
+    if let Some(d) = &cache_dir {
+        info!(dir = %d.display(), "proxy cache enabled");
+    }
+    let cache_ttl = cache_ttl
+        .or(cfg.server.cache_ttl)
+        .unwrap_or(tiles::cache::DEFAULT_TTL_SECS);
+    let state = server::build_state(
+        &sources,
+        &runtime,
+        cache_max_age,
+        public_url,
+        api_key,
+        cache_dir,
+        cache_ttl,
+    )
+    .await?;
 
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()

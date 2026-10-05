@@ -3662,6 +3662,7 @@ dependencies = [
  "clap",
  "futures-util",
  "geo",
+ "httpdate",
  "object_store",
  "osmpbfreader",
  "redb",
