@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use geo::{
     BooleanOps, Contains, Coord, Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon,
-    Point, Polygon, SimplifyVw,
+    Point, Polygon, SimplifyVw, Translate,
 };
 use osmpbfreader::{OsmId, OsmObj, OsmPbfReader, Tags};
 use redb::ReadableDatabase;
@@ -923,9 +923,12 @@ fn build_tiles(features: &[Feature], minzoom: u8, maxzoom: u8) -> Result<HashMap
                 for ty in ty0.max(0)..=ty1.min(n - 1) {
                     let rect = tile_rect(tx, ty);
                     if let Some(clipped) = clip_geom(&g, &rect) {
+                        // MVT geometry is tile-local: shift out of the global
+                        // tile-grid space into [0, EXTENT] plus the buffer ring.
+                        let local = clipped.translate(-(tx * EXTENT) as f64, -(ty * EXTENT) as f64);
                         out.entry(TileCoord::new(z, tx as u32, ty as u32)?)
                             .or_default()
-                            .push((f.layer, clipped, f.props.clone()));
+                            .push((f.layer, local, f.props.clone()));
                     }
                 }
             }
@@ -947,7 +950,12 @@ fn build_tiles(features: &[Feature], minzoom: u8, maxzoom: u8) -> Result<HashMap
         let mut layer_vec: Vec<VectorTileLayer> = feats_by_layer
             .into_iter()
             .filter_map(|(name, feats)| {
-                VectorTileLayer::from_features(name.to_string(), feats, 4096, 2).ok()
+                let mut layer =
+                    VectorTileLayer::from_features(name.to_string(), feats, 4096, 2).ok()?;
+                for f in layer.features.iter_mut() {
+                    fix_closepath_counts(&mut f.geom_data);
+                }
+                Some(layer)
             })
             .collect();
         layer_vec.sort_by(|a, b| a.name.cmp(&b.name));
@@ -962,6 +970,50 @@ fn build_tiles(features: &[Feature], minzoom: u8, maxzoom: u8) -> Result<HashMap
         );
     }
     Ok(tiles)
+}
+
+/// Repair the MVT geometry command stream emitted by the upstream encoder:
+/// it writes ClosePath as 0x07 (command 7, count 0), but the spec requires
+/// a count of at least 1 and strict decoders (OpenLayers) stall on count 0.
+/// A count-0 ClosePath is a single byte, so the patch is in place.
+fn fix_closepath_counts(geom_data: &mut versatiles_core::Blob) {
+    let buf = geom_data.as_mut_slice();
+    let mut i = 0;
+    while i < buf.len() {
+        let start = i;
+        let mut v: u64 = 0;
+        let mut shift = 0;
+        while i < buf.len() {
+            let b = buf[i];
+            i += 1;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b < 0x80 {
+                break;
+            }
+            shift += 7;
+        }
+        let (cmd, count) = (v & 7, v >> 3);
+        match cmd {
+            7 => {
+                if count == 0 {
+                    buf[start] = 0x0f;
+                }
+            }
+            1 | 2 => {
+                // MoveTo / LineTo: skip count*2 zigzag-encoded coord varints.
+                for _ in 0..count * 2 {
+                    if i >= buf.len() {
+                        break;
+                    }
+                    while buf[i] >= 0x80 && i < buf.len() {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => break,
+        }
+    }
 }
 
 fn simplify(g: &Geometry<f64>, eps: f64) -> Geometry<f64> {
