@@ -2,7 +2,7 @@
 //!
 //! Sources can be local files, HTTP(S) URLs, or s3:// URIs. Everything is served
 //! from a single binary: tiles, TileJSON, a generated style, and a vendored
-//! MapLibre viewer, so a browser never talks to a third party.
+//! OpenLayers viewer, so a browser never has to load code from a third party.
 
 pub mod cache;
 pub mod config;

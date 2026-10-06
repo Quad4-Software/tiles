@@ -7,8 +7,9 @@ provider catalogs, delta-updates PMTiles files, and proxies upstream tile
 endpoints with a disk cache.
 
 Container I/O is [versatiles-rs](https://github.com/versatiles-org/versatiles-rs)
-(`versatiles_container` 4.15). HTTP is axum. The viewer is vendored MapLibre
-GL JS: the browser makes no third-party requests.
+(`versatiles_container` 4.15). HTTP is axum. The viewer is a vendored
+OpenLayers bundle (`ol` + `ol-mapbox-style`, built from `web/`): the browser
+makes no third-party code requests.
 
 ## Install
 
@@ -34,6 +35,26 @@ upstream tile template containing `{z}/{x}/{y}` (proxied).
 tiles serve --source osm=data/osm.pmtiles \
             --source topo=https://a.tile.opentopomap.org/{z}/{x}/{y}.png
 ```
+
+An `http(s)://` spec without `{z}/{x}/{y}` placeholders and without a
+container extension is fetched as a TileJSON document; the first `tiles[]`
+entry becomes the upstream template. Providers that publish dated tile
+snapshots (for example OpenFreeMap) can be followed this way:
+
+```sh
+tiles serve --source ofm=https://tiles.openfreemap.org/planet
+```
+
+A source under `tiles.openfreemap.org` with no custom style gets the
+OpenFreeMap Bright style automatically, rewired to this server's tilejson
+so tiles flow through the proxy cache.
+
+A custom `style` (in config or `--style NAME=PATH_OR_URL`) may be a local
+JSON file or an `http(s)://` URL fetched once at startup. In the style, a
+source of the same type whose `url` is missing, empty, `"auto"`, or an
+ancestor/descendant of the proxy prefix is rewritten to this server's
+tilejson; unrelated sources (sprites, glyphs, relief overlays) are left
+untouched.
 
 ## Commands
 
@@ -89,7 +110,7 @@ sources:
 | `GET /{name}/tilejson.json` | TileJSON pointing at this server |
 | `GET /{name}/{z}/{x}/{y}.{ext}` | tile |
 | `GET /{name}/style.json` | generated or custom MapLibre style |
-| `GET /{name}/view` | MapLibre viewer |
+| `GET /{name}/view` | OpenLayers viewer |
 
 Tiles are served with their stored compression when the client accepts it
 (gzip/brotli) and recompressed otherwise. Responses carry an `ETag`;
@@ -132,6 +153,15 @@ the config, or `--upstream-header "NAME|K: v"` on the CLI. An upstream
 S3 uses the standard `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ENDPOINT`,
 `AWS_ALLOW_HTTP` variables via `object_store`.
+
+## Viewer bundle
+
+`assets/ol-viewer.js` and `assets/ol.css` are vendored build output. To
+rebuild after changing `web/viewer.js` or bumping `ol`:
+
+```sh
+cd web && npm install && npm run build
+```
 
 ## Container
 

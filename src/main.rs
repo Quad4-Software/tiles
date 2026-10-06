@@ -51,10 +51,10 @@ enum Cmd {
         /// (otherwise derived from request headers).
         #[arg(long, value_name = "URL", env = "TILES_PUBLIC_URL")]
         public_url: Option<String>,
-        /// Custom MapLibre style file for a source: NAME=PATH. Repeatable.
-        /// In the style file, a source with no url or "url":"auto" is wired
+        /// Custom MapLibre style for a source: NAME=PATH_OR_URL. Repeatable.
+        /// A source in the style with no url or "url":"auto" is wired
         /// to this server's tilejson automatically.
-        #[arg(long, value_name = "NAME=PATH")]
+        #[arg(long, value_name = "NAME=PATH_OR_URL")]
         style: Vec<String>,
         /// Extra header sent to an upstream (proxy sources): "NAME|Header: v".
         /// Repeatable. An Authorization/User-Agent header works the same.
@@ -376,11 +376,11 @@ async fn serve(o: ServeOpts) -> Result<()> {
     for s in &cli_styles {
         let (name, path) = s
             .split_once('=')
-            .with_context(|| format!("expected NAME=PATH, got '{s}'"))?;
+            .with_context(|| format!("expected NAME=PATH_OR_URL, got '{s}'"))?;
         let Some(src) = sources.iter_mut().find(|x| x.name == name) else {
             bail!("--style '{s}': no source named '{name}'");
         };
-        src.style = Some(PathBuf::from(path));
+        src.style = Some(path.to_string());
     }
     for h in &cli_upstream_headers {
         let (name, hv) = h

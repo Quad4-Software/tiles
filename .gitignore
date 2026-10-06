@@ -3,3 +3,4 @@
 *.versatiles
 *.pmtiles
 *.mbtiles
+/web/node_modules/

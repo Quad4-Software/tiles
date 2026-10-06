@@ -339,11 +339,44 @@ async fn generate_osm_pbf_to_pmtiles() {
     // Monaco z14 tile containing the city center must exist and be non-empty.
     let coord = TileCoord::new(14, 8529, 5973).unwrap();
     let tile = reader.tile(&coord).await.unwrap().expect("tile");
+    let blob = tile.into_blob(&TileCompression::Uncompressed).unwrap();
+    assert!(blob.len() > 100);
+
+    // MVT geometry must be tile-local: coords in [-64, 4096+64] (buffer ring),
+    // not the global tile-grid space. Regresses the absolute-coords bug that
+    // produced blank tiles in standard renderers.
+    let vt = versatiles_geometry::vector_tile::VectorTile::from_blob(&blob).unwrap();
+    let mut checked = 0usize;
+    let walk = |g: &geo::Geometry<f64>, out: &mut Vec<(f64, f64)>| match g {
+        geo::Geometry::Point(p) => out.push((p.x(), p.y())),
+        geo::Geometry::LineString(l) => out.extend(l.0.iter().map(|c| (c.x, c.y))),
+        geo::Geometry::Polygon(p) => out.extend(p.exterior().0.iter().map(|c| (c.x, c.y))),
+        geo::Geometry::MultiPoint(mp) => out.extend(mp.0.iter().map(|p| (p.x(), p.y()))),
+        geo::Geometry::MultiLineString(ml) => {
+            out.extend(ml.0.iter().flat_map(|l| l.0.iter().map(|c| (c.x, c.y))))
+        }
+        geo::Geometry::MultiPolygon(mp) => out.extend(
+            mp.0.iter()
+                .flat_map(|p| p.exterior().0.iter().map(|c| (c.x, c.y))),
+        ),
+        _ => {}
+    };
+    for layer in vt.layers.iter() {
+        for f in layer.to_features().unwrap() {
+            let mut pts = Vec::new();
+            walk(&f.geometry, &mut pts);
+            for (x, y) in pts {
+                checked += 1;
+                assert!(
+                    (-64.0..=4160.0).contains(&x) && (-64.0..=4160.0).contains(&y),
+                    "coordinate out of tile-local range: {x},{y}"
+                );
+            }
+        }
+    }
     assert!(
-        tile.into_blob(&TileCompression::Uncompressed)
-            .unwrap()
-            .len()
-            > 100
+        checked > 50,
+        "expected to check many vertices, got {checked}"
     );
 }
 
@@ -424,6 +457,132 @@ fn proxy_template_detection() {
     ));
     assert!(!source::is_proxy_template("https://x.com/map.pmtiles"));
     assert!(!source::is_proxy_template("/data/map.versatiles"));
+}
+
+/// Plain http(s) specs without placeholders or a container extension are
+/// treated as TileJSON endpoints and resolved at startup.
+#[test]
+fn tilejson_endpoint_detection() {
+    assert!(source::is_tilejson_endpoint(
+        "https://tiles.openfreemap.org/planet"
+    ));
+    assert!(source::is_tilejson_endpoint("https://x.com/map.json"));
+    assert!(!source::is_tilejson_endpoint(
+        "https://x.com/m/{z}/{x}/{y}.pbf"
+    ));
+    assert!(!source::is_tilejson_endpoint("https://x.com/map.pmtiles"));
+    assert!(!source::is_tilejson_endpoint("/data/map.pmtiles"));
+}
+
+/// A TileJSON endpoint source resolves its tiles[] template at startup and
+/// serves tiles through the proxy path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tilejson_endpoint_source() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let tiles_url = format!("http://127.0.0.1:{port}/snap/20260101/{{z}}/{{x}}/{{y}}.pbf");
+    let upstream = axum::Router::new()
+        .route(
+            "/tilejson",
+            axum::routing::get(move || {
+                let tiles_url = tiles_url.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "tilejson": "3.0.0",
+                        "tiles": [tiles_url]
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/snap/{*rest}",
+            axum::routing::get(|| async {
+                (
+                    [("content-type", "application/vnd.mapbox-vector-tile")],
+                    b"MVT".to_vec(),
+                )
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let runtime = common::test_runtime();
+    let state = server::build_state(
+        &[named("m", &format!("http://127.0.0.1:{port}/tilejson"))],
+        &runtime,
+        60,
+        None,
+        None,
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+    let app = server::router(state);
+
+    let (s, _, body) = get(app, "/m/1/1/1.pbf", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(body, b"MVT");
+}
+
+/// A remote style is fetched once at startup; a same-kind source whose url
+/// matches the proxy prefix in either direction is rewired to this server's
+/// tilejson, while unrelated sources stay remote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_style_rewires_to_local_tilejson() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let style_body = serde_json::json!({
+        "version": 8,
+        "name": "test",
+        "sources": {
+            // ancestor of the proxy template -> rewired
+            "openmaptiles": { "type": "vector", "url": format!("http://127.0.0.1:{port}/planet") },
+            // explicit "auto" marker -> rewired
+            "auto_src": { "type": "vector", "url": "auto" },
+            // different kind and host -> left alone
+            "shaded": { "type": "raster", "url": "https://remote.example/dem/tilejson" }
+        },
+        "layers": [{"id": "bg", "type": "background"}]
+    });
+    let upstream = axum::Router::new()
+        .route(
+            "/style.json",
+            axum::routing::get(move || {
+                let style_body = style_body.clone();
+                async move { axum::Json(style_body) }
+            }),
+        )
+        .route("/planet/{*rest}", axum::routing::get(|| async { b"TILE" }));
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let mut src = named(
+        "m",
+        &format!("http://127.0.0.1:{port}/planet/{{z}}/{{x}}/{{y}}.pbf"),
+    );
+    src.style = Some(format!("http://127.0.0.1:{port}/style.json"));
+    let runtime = common::test_runtime();
+    let state = server::build_state(&[src], &runtime, 60, None, None, None, 0)
+        .await
+        .unwrap();
+    let app = server::router(state);
+
+    let (s, _, body) = get(app, "/m/style.json", "gzip").await;
+    assert_eq!(s, StatusCode::OK);
+    let style: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    for s in ["openmaptiles", "auto_src"] {
+        assert!(
+            style["sources"][s]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/m/tilejson.json"),
+            "{s}: {}",
+            style["sources"][s]["url"]
+        );
+    }
+    assert_eq!(
+        style["sources"]["shaded"]["url"].as_str().unwrap(),
+        "https://remote.example/dem/tilejson"
+    );
 }
 
 /// API-key auth: everything except /health is protected, and the key works

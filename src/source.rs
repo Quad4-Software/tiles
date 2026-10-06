@@ -67,12 +67,13 @@ pub async fn open(spec: &str, runtime: &TilesRuntime) -> Result<SharedTileSource
 }
 
 /// A `name=spec` pair as accepted by `--source` and the config file.
-/// `style` optionally points to a custom MapLibre style JSON file.
+/// `style` optionally points to a custom MapLibre style JSON document:
+/// a local file path or an http(s) URL.
 #[derive(Debug, Clone)]
 pub struct NamedSource {
     pub name: String,
     pub spec: String,
-    pub style: Option<std::path::PathBuf>,
+    pub style: Option<String>,
     /// Extra headers sent to upstream (proxy sources only).
     pub headers: Vec<String>,
 }
@@ -101,6 +102,16 @@ impl std::str::FromStr for NamedSource {
 /// tile proxy template, not a container.
 pub fn is_proxy_template(spec: &str) -> bool {
     spec.contains("{z}") && spec.contains("{x}") && spec.contains("{y}")
+}
+
+/// An http(s) spec without tile placeholders and without a range-readable
+/// container extension is treated as a TileJSON endpoint: the document's
+/// first `tiles` entry becomes the upstream template. This tracks dated
+/// tile paths (e.g. openfreemap's `/planet/<snapshot>/...`) automatically.
+pub fn is_tilejson_endpoint(spec: &str) -> bool {
+    (spec.starts_with("http://") || spec.starts_with("https://"))
+        && !is_proxy_template(spec)
+        && !supports_remote_extension(spec)
 }
 
 /// Convenience used by tests: open a remote container only when the format

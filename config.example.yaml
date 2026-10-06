@@ -9,8 +9,10 @@ server:
 
 sources:
   - name: osm
-    src: /data/firenze.pmtiles
-    # style: /data/osm-style.json          # custom MapLibre style for /osm/style.json
+    src: /data/monaco.pmtiles
+    # style: /data/osm-style.json          # MapLibre style for /osm/style.json
+    # style: https://x.com/style.json      # remote styles are fetched once at startup
+                                         # and rewired to this server's tilejson
   # - name: planet
   #   src: /data/osm.versatiles
   # - name: bucket-copy
@@ -18,6 +20,12 @@ sources:
 
 # Upstream proxies: any spec containing {z}/{x}/{y} forwards tile requests.
 # Respect each provider's usage policy; this forwards real traffic.
+  # - name: ofm
+  #   src: https://tiles.openfreemap.org/planet   # TileJSON endpoint: the
+  #                                             # current dated snapshot is
+  #                                             # followed automatically, and
+  #                                             # OpenFreeMap Bright is applied
+  #                                             # as the default style.
   # - name: topo
   #   src: https://a.tile.opentopomap.org/{z}/{x}/{y}.png
   # - name: rail

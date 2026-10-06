@@ -1,0 +1,15 @@
+{
+  "name": "tiles-viewer",
+  "private": true,
+  "description": "Builds the vendored OpenLayers viewer bundle served from /assets.",
+  "dependencies": {
+    "ol": "10.11.0",
+    "ol-mapbox-style": "13.5.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "scripts": {
+    "build": "esbuild viewer.js --bundle --minify --format=iife --global-name=tilesViewer --outfile=../assets/ol-viewer.js && cp node_modules/ol/ol.css ../assets/ol.css"
+  }
+}

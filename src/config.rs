@@ -77,9 +77,10 @@ fn default_cache_max_age() -> u32 {
 pub struct ConfigSource {
     pub name: String,
     pub src: String,
-    /// Optional path to a custom style.json served at /{name}/style.json.
+    /// Optional custom style.json served at /{name}/style.json:
+    /// a local file path or an http(s) URL.
     #[serde(default)]
-    pub style: Option<std::path::PathBuf>,
+    pub style: Option<String>,
     /// Extra headers sent to the upstream (proxy sources only), as
     /// "Name: value" strings.
     #[serde(default)]

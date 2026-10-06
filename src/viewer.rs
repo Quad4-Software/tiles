@@ -1,12 +1,12 @@
-//! Built-in viewer: vendored MapLibre assets plus a generated style, so the
+//! Built-in viewer: vendored OpenLayers assets plus a generated style, so the
 //! demo page works without touching any CDN or third-party service.
 
 use std::collections::HashMap;
 
 use crate::server::{Backend, ServerSource};
 
-pub const MAPLIBRE_JS: &[u8] = include_bytes!("../assets/maplibre-gl.js");
-pub const MAPLIBRE_CSS: &[u8] = include_bytes!("../assets/maplibre-gl.css");
+pub const OL_JS: &[u8] = include_bytes!("../assets/ol-viewer.js");
+pub const OL_CSS: &[u8] = include_bytes!("../assets/ol.css");
 
 const PAGE_CSS: &str = "html,body,#map{height:100%;margin:0;padding:0}";
 
@@ -22,7 +22,9 @@ pub fn index_html(sources: &HashMap<String, ServerSource>, base: &str, qs: &str)
                 _ => "vector",
             };
             format!(
-                "<div class=card><div class=head><span class=name>{n}</span>				 <span class=badge>{kind}</span><span class=badge>{e}</span></div>				 <div class=links><a href=\"/{n}/view{qs}\">view</a>				 <a href=\"/{n}/tilejson.json{qs}\">tilejson</a>				 <a href=\"/{n}/style.json{qs}\">style</a></div>				 <code class=url>{base}/{n}/{{z}}/{{x}}/{{y}}.{e}</code></div>",
+                "<div class=card><div class=head><a class=name href=\"/{n}/view{qs}\">{n}</a>\
+				 <span class=badge>{kind}</span><span class=badge>{e}</span></div>\
+				 <pre class=eps>view      {base}/{n}/view{qs}\ntilejson  {base}/{n}/tilejson.json{qs}\nstyle     {base}/{n}/style.json{qs}\ntiles     {base}/{n}/{{z}}/{{x}}/{{y}}.{e}{qs}</pre></div>",
                 n = s.name,
                 e = s.extensions[0],
             )
@@ -32,20 +34,21 @@ pub fn index_html(sources: &HashMap<String, ServerSource>, base: &str, qs: &str)
         r#"<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>tiles</title><style>
-:root{{--bg:#f6f7f8;--fg:#1c1f22;--mut:#6b7280;--line:#e2e5e8;--card:#fff;--acc:#2f6feb}}
-@media(prefers-color-scheme:dark){{:root{{--bg:#0f1214;--fg:#e4e7ea;--mut:#8b949c;--line:#262b30;--card:#171b1f;--acc:#6ea8fe}}}}
+:root{{--bg:#fafafa;--fg:#18181b;--mut:#71717a;--line:#e9e9ec;--card:#fff;--well:#f4f4f5}}
+@media(prefers-color-scheme:dark){{:root{{--bg:#0a0a0b;--fg:#d9d9de;--mut:#a1a1aa;--line:#1f1f24;--card:#16161a;--well:#101013}}}}
 *{{box-sizing:border-box}}
 body{{font:15px/1.5 system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);max-width:56rem;margin:0 auto;padding:3rem 1.25rem}}
-h1{{font-size:1.5rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .4rem}}
+h1{{font-size:1.25rem;font-weight:600;letter-spacing:-.01em;margin:0 0 .4rem}}
 .sub{{color:var(--mut);margin:0 0 2rem}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem 1.25rem;margin-bottom:.75rem}}
-.head{{display:flex;align-items:baseline;gap:.5rem;margin-bottom:.4rem}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.9rem 1.1rem;margin-bottom:.6rem}}
+.head{{display:flex;align-items:baseline;gap:.5rem}}
 .name{{font-weight:600}}
+a{{color:inherit}}
+a.name{{text-decoration:none}}
+a.name:hover{{text-decoration:underline}}
 .badge{{font:11px/1 ui-monospace,monospace;color:var(--mut);border:1px solid var(--line);border-radius:99px;padding:.2rem .55rem}}
-.links{{display:flex;gap:1rem;margin:.3rem 0 .5rem}}
-a{{color:var(--acc);text-decoration:none}}
-a:hover{{text-decoration:underline}}
-.url{{display:block;font:12px/1.6 ui-monospace,monospace;color:var(--mut);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.35rem .6rem;overflow-x:auto;white-space:nowrap}}
+.head .badge:first-of-type{{margin-left:auto}}
+.eps{{margin:.6rem 0 0;font:12px/1.7 ui-monospace,monospace;color:var(--mut);background:var(--well);border:1px solid var(--line);border-radius:6px;padding:.5rem .7rem;overflow-x:auto}}
 </style>
 <h1>tiles</h1><p class=sub>{count} source{sfx} serving on this instance.</p>
 {items}"#,
@@ -54,16 +57,18 @@ a:hover{{text-decoration:underline}}
     )
 }
 
-pub fn view_html(name: &str) -> String {
+pub fn view_html(name: &str, tile_ext: &str) -> String {
     format!(
-        "<!doctype html><meta charset=utf-8><title>{name} | tiles</title>\
-		 <link rel=stylesheet href=/assets/maplibre-gl.css><style>{PAGE_CSS}\
+        "<!doctype html><meta charset=utf-8>\
+		 <meta name=viewport content=\"width=device-width,initial-scale=1\">\
+		 <title>{name} | tiles</title>\
+		 <link rel=stylesheet href=/assets/ol.css><style>{PAGE_CSS}\
 		 #err{{position:fixed;top:0;left:0;right:0;background:#c33;color:#fff;\
 		 font:14px/1.4 monospace;padding:.5em 1em;z-index:9;white-space:pre-wrap}}\
-		 #stat{{position:fixed;bottom:0;right:0;background:#000a;color:#0f0;\
+		 #stat{{position:fixed;bottom:0;right:0;background:#000a;color:#ddd;\
 		 font:12px/1.5 monospace;padding:.3em .8em;z-index:9;text-align:right}}\
 		 </style>\
-		 <div id=map></div><script src=/assets/maplibre-gl.js></script><script>\
+		 <div id=map></div><script src=/assets/ol-viewer.js></script><script>\
 		 function err(m){{var e=document.createElement('div');e.id='err';\
 		 e.textContent='tiles viewer: '+m;document.body.appendChild(e)}}\
 		 window.onerror=function(m,s,l,c){{err(m+' @'+s+':'+l+':'+c)}};\
@@ -71,30 +76,43 @@ pub fn view_html(name: &str) -> String {
 		 Promise.all([\
 		 fetch('/{name}/tilejson.json'+location.search).then(r=>r.status),\
 		 fetch('/{name}/style.json'+location.search).then(r=>r.status),\
-		 fetch('/{name}/0/0/0.pbf'+location.search).then(r=>r.status+' '+r.headers.get('content-length')+'B')\
+		 fetch('/{name}/0/0/0.{tile_ext}'+location.search).then(r=>r.arrayBuffer().then(b=>r.status+' '+b.byteLength+'B'))\
 		 ]).then(function(x){{var d=document.createElement('div');d.id='stat';\
 		 d.textContent='tilejson '+x[0]+' | style '+x[1]+' | tile '+x[2];\
 		 document.body.appendChild(d)}})}}\
 		 stat();\
-		 if(typeof maplibregl==='undefined'){{err('maplibre-gl.js failed to load')}}\
-		 else{{try{{var map=new maplibregl.Map({{container:'map',\
-		 style:'/{name}/style.json'+location.search,hash:true,\
-		 attributionControl:{{compact:true}}}});\
-		 map.addControl(new maplibregl.NavigationControl());\
-		 map.addControl(new maplibregl.ScaleControl());\
-		 map.on('error',function(e){{err('map: '+(e.error&&e.error.message||e.type))}})\
-		 }}catch(e){{err('init: '+((e.error&&e.error.message)||e.message||e))}}}}\
+		 if(typeof tilesViewer==='undefined'){{err('ol-viewer.js failed to load')}}\
+		 else{{try{{tilesViewer.init('/{name}/style.json'+location.search)\
+		 .catch(function(e){{err('style: '+(e&&e.message||e))}})\
+		 }}catch(e){{err('init: '+(e&&e.message||e))}}}}\
 		 </script>"
     )
 }
 
-/// Deterministic, pleasant-enough color from a layer name.
+/// Muted palette for common OpenMapTiles-ish layer names. Anything else gets
+/// a deterministic, desaturated hash color.
 fn layer_color(id: &str) -> String {
+    const KNOWN: &[(&[&str], &str)] = &[
+        (&["water", "ocean"], "#aac6d8"),
+        (&["landuse", "natural", "landcover", "park"], "#dde4dc"),
+        (&["buildings", "building"], "#cfcdc8"),
+        (
+            &["roads", "transportation", "transit", "aeroway", "streets"],
+            "#a09a90",
+        ),
+        (&["boundaries", "boundary"], "#7d7d88"),
+        (&["places", "pois", "poi"], "#52525f"),
+    ];
+    for (names, color) in KNOWN {
+        if names.contains(&id) {
+            return color.to_string();
+        }
+    }
     let mut h: u32 = 0x811c9dc5;
     for b in id.bytes() {
         h = (h ^ b as u32).wrapping_mul(0x01000193);
     }
-    format!("hsl({}, 65%, 45%)", h % 360)
+    format!("hsl({}, 28%, 42%)", h % 360)
 }
 
 /// Build a minimal MapLibre style for a source: one fill, line, and circle
@@ -110,7 +128,7 @@ pub fn style_for(
     let mut layers = vec![serde_json::json!({
         "id": "background",
         "type": "background",
-        "paint": { "background-color": "#dfe9ef" }
+        "paint": { "background-color": "#f4f4f5" }
     })];
 
     if is_raster {
@@ -123,11 +141,13 @@ pub fn style_for(
                 continue;
             };
             let color = layer_color(id);
+            // No geometry-type filters: renderers ignore mismatched geometry
+            // (fills only apply to polygons, circles only to points), and
+            // filtering on "Polygon" would wrongly skip MultiPolygons.
             layers.push(serde_json::json!({
                 "id": format!("{id}-fill"), "type": "fill",
                 "source": "tiles", "source-layer": id,
-                "filter": ["==", ["geometry-type"], "Polygon"],
-                "paint": { "fill-color": color, "fill-opacity": 0.4 }
+                "paint": { "fill-color": color, "fill-opacity": 0.55 }
             }));
             layers.push(serde_json::json!({
                 "id": format!("{id}-line"), "type": "line",
@@ -137,7 +157,6 @@ pub fn style_for(
             layers.push(serde_json::json!({
                 "id": format!("{id}-point"), "type": "circle",
                 "source": "tiles", "source-layer": id,
-                "filter": ["==", ["geometry-type"], "Point"],
                 "paint": { "circle-radius": 3, "circle-color": color }
             }));
         }

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -34,14 +34,78 @@ pub struct ProxySpec {
     pub client: reqwest::Client,
 }
 
+/// Where a source's /{name}/style.json comes from.
+pub enum StyleSpec {
+    /// Local JSON file, read per request.
+    File(std::path::PathBuf),
+    /// Remote style document fetched at startup.
+    Remote(serde_json::Value),
+}
+
 /// One opened tile source, ready to serve.
 pub struct ServerSource {
     pub name: String,
     pub backend: Backend,
     pub mime: String,
     pub extensions: Vec<String>,
-    /// Optional custom MapLibre style JSON file served at /{name}/style.json.
-    pub style_path: Option<std::path::PathBuf>,
+    /// Optional custom MapLibre style served at /{name}/style.json:
+    /// a local file or an http(s) URL (fetched once at startup).
+    pub style: Option<StyleSpec>,
+}
+
+/// OpenFreeMap publishes a canonical "bright" style for its OpenMapTiles
+/// vector tiles. Proxy sources pointed at tiles.openfreemap.org get it as
+/// their default style instead of the generated per-layer fallback.
+const OFM_STYLE_URL: &str = "https://tiles.openfreemap.org/styles/bright";
+const OFM_TILES_HOST: &str = "https://tiles.openfreemap.org/";
+
+/// Fetch a remote style document; carries the source's upstream headers.
+async fn fetch_remote_style(url: &str, headers: &[String]) -> Result<serde_json::Value> {
+    let client = crate::http::HttpOpts {
+        headers: headers.to_vec(),
+        ..Default::default()
+    }
+    .client(Some(std::time::Duration::from_secs(30)))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("style fetch '{url}' failed"))?
+        .error_for_status()
+        .with_context(|| format!("style fetch '{url}' returned an error"))?;
+    let text = resp
+        .text()
+        .await
+        .with_context(|| format!("style fetch '{url}' failed to read body"))?;
+    serde_json::from_str(&text).with_context(|| format!("style '{url}' is not valid JSON"))
+}
+
+/// Resolve a configured `style` value (local path or http(s) URL) plus the
+/// OpenFreeMap default for unstyled OFM proxies.
+async fn resolve_style(def: &NamedSource) -> Result<Option<StyleSpec>> {
+    match &def.style {
+        Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
+            info!("source '{}': fetching remote style {}", def.name, s);
+            Ok(Some(StyleSpec::Remote(
+                fetch_remote_style(s, &def.headers).await?,
+            )))
+        }
+        Some(s) => Ok(Some(StyleSpec::File(std::path::PathBuf::from(s)))),
+        None if def.spec.starts_with(OFM_TILES_HOST) => {
+            // best-effort: fall back to the generated style if OFM is down
+            match fetch_remote_style(OFM_STYLE_URL, &def.headers).await {
+                Ok(v) => {
+                    info!("source '{}': using openfreemap bright style", def.name);
+                    Ok(Some(StyleSpec::Remote(v)))
+                }
+                Err(e) => {
+                    tracing::warn!("source '{}': {e:#}; using generated style", def.name);
+                    Ok(None)
+                }
+            }
+        }
+        None => Ok(None),
+    }
 }
 
 impl ServerSource {
@@ -81,12 +145,9 @@ pub async fn build_state(
         if sources.contains_key(&def.name) {
             bail!("duplicate source name '{}'", def.name);
         }
-        let (backend, mime, extensions) = if source::is_proxy_template(&def.spec) {
-            if !def.spec.starts_with("http") {
-                bail!("proxy source '{}' must be an http(s) url", def.spec);
-            }
-            let (mime, raster) = proxy_mime(&def.spec);
-            let ext = proxy_extension(&def.spec);
+        let is_proxy = source::is_proxy_template(&def.spec);
+        let is_tilejson = source::is_tilejson_endpoint(&def.spec);
+        let (backend, mime, extensions) = if is_proxy || is_tilejson {
             let mut opts = crate::http::HttpOpts {
                 headers: def.headers.clone(),
                 ..Default::default()
@@ -101,13 +162,28 @@ pub async fn build_state(
                     break;
                 }
             }
-            info!("source '{}' -> {} (upstream proxy)", def.name, def.spec);
+            let client = opts.client(Some(std::time::Duration::from_secs(30)))?;
+            let template = if is_proxy {
+                def.spec.clone()
+            } else {
+                tilejson_template(&client, &def.spec)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "source '{}': cannot resolve tilejson '{}'",
+                            def.name, def.spec
+                        )
+                    })?
+            };
+            let (mime, raster) = proxy_mime(&template);
+            let ext = proxy_extension(&template);
+            info!("source '{}' -> {} (upstream proxy)", def.name, template);
             (
                 Backend::Proxy(ProxySpec {
-                    template: def.spec.clone(),
+                    template,
                     extensions: vec![ext.clone()],
                     raster,
-                    client: opts.client(Some(std::time::Duration::from_secs(30)))?,
+                    client,
                 }),
                 mime.to_string(),
                 vec![ext],
@@ -157,7 +233,7 @@ pub async fn build_state(
                 backend,
                 mime,
                 extensions,
-                style_path: def.style.clone(),
+                style: resolve_style(def).await?,
             },
         );
     }
@@ -235,6 +311,31 @@ fn proxy_mime(spec: &str) -> (&'static str, bool) {
     }
 }
 
+/// Fetch a TileJSON document and take its first `tiles` entry as the
+/// upstream tile template.
+async fn tilejson_template(client: &reqwest::Client, url: &str) -> Result<String> {
+    let text = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} returned an error"))?
+        .text()
+        .await?;
+    let tj: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("'{url}' is not valid JSON"))?;
+    let t = tj["tiles"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("tilejson '{url}' has no tiles[] entries"))?;
+    if !source::is_proxy_template(t) {
+        bail!("tilejson '{url}' tiles entry '{t}' is not a {{z}}/{{x}}/{{y}} template");
+    }
+    Ok(t.to_string())
+}
+
 fn proxy_extension(spec: &str) -> String {
     let path = spec.split(['?', '#']).next().unwrap_or(spec);
     path.rsplit(['/', '.'])
@@ -248,8 +349,8 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
-        .route("/assets/maplibre-gl.js", get(maplibre_js))
-        .route("/assets/maplibre-gl.css", get(maplibre_css))
+        .route("/assets/ol-viewer.js", get(ol_viewer_js))
+        .route("/assets/ol.css", get(ol_css))
         .route("/{name}/tilejson.json", get(tilejson))
         .route("/{name}/style.json", get(style))
         .route("/{name}/view", get(view))
@@ -320,6 +421,8 @@ fn tilejson_for(entry: &ServerSource, base: &str, ext: &str, qs: &str) -> serde_
             "maxzoom": 22,
             "format": ext,
             "name": entry.name,
+            "bounds": [-180.0, -85.0511287798066, 180.0, 85.0511287798066],
+            "center": [0.0, 0.0, 2],
         }),
     }
 }
@@ -341,24 +444,24 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn maplibre_js() -> Response {
+async fn ol_viewer_js() -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
-        viewer::MAPLIBRE_JS,
+        viewer::OL_JS,
     )
         .into_response()
 }
 
-async fn maplibre_css() -> Response {
+async fn ol_css() -> Response {
     (
         [
             (header::CONTENT_TYPE, "text/css; charset=utf-8"),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
-        viewer::MAPLIBRE_CSS,
+        viewer::OL_CSS,
     )
         .into_response()
 }
@@ -379,6 +482,65 @@ async fn tilejson(
     )))
 }
 
+/// Point a custom style's tile sources at this server's tilejson.
+///
+/// A source with no url, an empty url, or "url":"auto" always rewires.
+/// Remote styles additionally rewire sources of the served tile kind
+/// (vector or raster): for proxy specs the source's url or tiles must
+/// share the spec's path prefix in either direction (a style's tilejson
+/// url typically sits above a dated tile path, e.g. openfreemap's
+/// /planet source vs a /planet/<snapshot>/{z}/{x}/{y} template), while
+/// auxiliary sources like shaded relief stay remote; for container
+/// sources the kind match alone is enough. Rewired sources get this
+/// server's tilejson url, which already carries any ?key= credential.
+fn rewire_style_sources(
+    style: &mut serde_json::Value,
+    entry: &ServerSource,
+    remote: bool,
+    tj_url: &str,
+) {
+    let kind = if entry.mime.starts_with("image/") {
+        "raster"
+    } else {
+        "vector"
+    };
+    let prefix: Option<String> = match &entry.backend {
+        Backend::Proxy(p) => p
+            .template
+            .split('{')
+            .next()
+            .map(|s| s.trim_end_matches('/').to_string()),
+        _ => None,
+    };
+    let under_prefix = |v: &serde_json::Value| {
+        let Some(p) = &prefix else { return true };
+        let hit = |u: Option<&str>| {
+            u.is_some_and(|u| {
+                u == p || u.starts_with(&format!("{p}/")) || p.starts_with(&format!("{u}/"))
+            })
+        };
+        hit(v["url"].as_str())
+            || hit(v["tiles"]
+                .as_array()
+                .and_then(|t| t.first())
+                .and_then(|t| t.as_str()))
+    };
+    let Some(sources) = style["sources"].as_object_mut() else {
+        return;
+    };
+    for v in sources.values_mut() {
+        let auto = v["url"]
+            .as_str()
+            .is_none_or(|u| u.is_empty() || u == "auto")
+            && v["tiles"].is_null();
+        let kind_match = remote && v["type"].as_str() == Some(kind) && under_prefix(v);
+        if auto || kind_match {
+            v.as_object_mut().map(|o| o.remove("tiles"));
+            v["url"] = serde_json::json!(tj_url);
+        }
+    }
+}
+
 async fn style(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -388,35 +550,34 @@ async fn style(
     let entry = get_source(&state, &name)?;
     let base = base_url(&headers, &state.public_url);
     let qs = key_qs(&uri, &state);
-    if let Some(path) = &entry.style_path {
-        let text = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        let mut style: serde_json::Value =
-            serde_json::from_str(&text).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-        let tj_url = format!("{base}/{}/tilejson.json{qs}", entry.name);
-        if let Some(sources) = style["sources"].as_object_mut() {
-            for (_k, v) in sources.iter_mut() {
-                let needs_url = v["url"]
-                    .as_str()
-                    .is_none_or(|u| u == "auto" || u.is_empty())
-                    && v["tiles"].is_null();
-                if needs_url {
-                    v["url"] = serde_json::json!(tj_url);
+    let tj_url = format!("{base}/{}/tilejson.json{qs}", entry.name);
+    match &entry.style {
+        Some(spec) => {
+            let remote = matches!(spec, StyleSpec::Remote(_));
+            let mut style: serde_json::Value = match spec {
+                StyleSpec::File(path) => {
+                    let text = tokio::fs::read_to_string(path)
+                        .await
+                        .map_err(|_| StatusCode::NOT_FOUND)?;
+                    serde_json::from_str(&text).map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?
                 }
-            }
+                StyleSpec::Remote(v) => v.clone(),
+            };
+            rewire_style_sources(&mut style, entry, remote, &tj_url);
+            Ok(Json(style).into_response())
         }
-        return Ok(Json(style).into_response());
+        None => {
+            let tj = tilejson_for(entry, &base, &entry.extensions[0], &qs);
+            let mut style = viewer::style_for(entry, &base, &tj);
+            if !qs.is_empty()
+                && let Some(u) = style["sources"]["tiles"]["url"].as_str()
+            {
+                let url = u.to_string();
+                style["sources"]["tiles"]["url"] = serde_json::json!(format!("{url}{qs}"));
+            }
+            Ok(Json(style).into_response())
+        }
     }
-    let tj = tilejson_for(entry, &base, &entry.extensions[0], &qs);
-    let mut style = viewer::style_for(entry, &base, &tj);
-    if !qs.is_empty()
-        && let Some(u) = style["sources"]["tiles"]["url"].as_str()
-    {
-        let url = u.to_string();
-        style["sources"]["tiles"]["url"] = serde_json::json!(format!("{url}{qs}"));
-    }
-    Ok(Json(style).into_response())
 }
 
 async fn view(
@@ -424,7 +585,7 @@ async fn view(
     Path(name): Path<String>,
 ) -> Result<Html<String>, StatusCode> {
     let entry = get_source(&state, &name)?;
-    Ok(Html(viewer::view_html(&entry.name)))
+    Ok(Html(viewer::view_html(&entry.name, &entry.extensions[0])))
 }
 
 /// HTTP `Content-Encoding` token for a stored tile compression.
